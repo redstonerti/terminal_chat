@@ -15,6 +15,8 @@ use std::{
 };
 use terminal_chat::ThreadPool;
 const PORT: &str = "10212";
+const DEFAULT_ADDRESS: Option<&str> = Some("127.0.0.1");
+const CHUNK_SIZE: usize = 256;
 #[derive(Debug)]
 struct Player {
     id: u32,
@@ -46,7 +48,6 @@ fn main_menu() {
         .items(&options)
         .interact()
         .unwrap();
-
     match selection {
         0 => {
             match TcpListener::bind(&format!("0.0.0.0:{PORT}")) {
@@ -61,27 +62,32 @@ fn main_menu() {
             };
         }
         1 => {
-            let ip: String = Input::with_theme(&ColorfulTheme::default())
-                .with_prompt("Enter IP address or domain name")
-                .validate_with(|x: &String| {
-                    match x.parse::<Ipv4Addr>() {
-                        Ok(_) => return Ok(()),
-                        Err(_) => match parse_domain_name(x) {
-                            Ok(name) => {
-                                if name.to_string().contains(".") {
-                                    return Ok(());
-                                } else {
-                                    return Err("Invalid domain name".to_owned());
+            let ip: String = match DEFAULT_ADDRESS {
+                Some(ip) => ip.to_string(),
+                None => Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Enter IP address or domain name")
+                    .validate_with(|x: &String| {
+                        match x.parse::<Ipv4Addr>() {
+                            Ok(_) => return Ok(()),
+                            Err(_) => match parse_domain_name(x) {
+                                Ok(name) => {
+                                    if name.to_string().contains(".") {
+                                        return Ok(());
+                                    } else {
+                                        return Err("Invalid domain name".to_owned());
+                                    }
                                 }
-                            }
-                            Err(_) => {
-                                return Err("Couldn't parse domain name or ip address".to_owned())
-                            }
-                        },
-                    };
-                })
-                .interact()
-                .unwrap();
+                                Err(_) => {
+                                    return Err(
+                                        "Couldn't parse domain name or ip address".to_owned()
+                                    )
+                                }
+                            },
+                        };
+                    })
+                    .interact()
+                    .unwrap(),
+            };
             let ip = format!("{ip}:{PORT}")
                 .to_socket_addrs()
                 .unwrap()
@@ -140,10 +146,7 @@ fn host(listener: TcpListener) {
                     }
                     for player in players_mutex.lock().unwrap().iter_mut() {
                         if player.id == received.0 {
-                            player
-                                .stream
-                                .write_all(format!("{join_message}\\t").as_bytes())
-                                .unwrap();
+                            send_message(&mut player.stream, join_message).unwrap();
                             break;
                         }
                     }
@@ -169,10 +172,7 @@ fn host(listener: TcpListener) {
 fn send_to_players(id: u32, message: String, players: Arc<Mutex<Vec<Player>>>) {
     for player in players.lock().unwrap().iter_mut() {
         if id != player.id {
-            player
-                .stream
-                .write_all(format!("{}\\t", message).as_bytes())
-                .unwrap();
+            send_message(&mut player.stream, message.clone()).unwrap();
         }
     }
 }
@@ -185,26 +185,17 @@ fn handle_connection(
     let mut first_time = true;
     let mut name: Option<String> = None;
     send_players(&mut stream, Arc::clone(&players), id);
-    loop {
-        match get_messages_from_stream(&mut stream) {
-            Ok(messages) => {
-                for message in messages {
-                    if first_time {
-                        name = Some(message.clone());
-                        let player = Player {
-                            id,
-                            name: message.clone(),
-                            stream: stream.try_clone().unwrap(),
-                        };
-                        players.lock().unwrap().push(player);
-                        first_time = false;
-                        tx.send((id, name.clone(), PlayerAction::Joined)).unwrap();
-                    } else {
-                        tx.send((id, name.clone(), PlayerAction::SentMessage(message)))
-                            .unwrap();
-                    }
-                }
-            }
+    let (string_tx, string_rx): (
+        Sender<Result<String, std::io::Error>>,
+        Receiver<Result<String, std::io::Error>>,
+    ) = channel();
+    let stream_clone = stream.try_clone().unwrap();
+    thread::spawn(|| {
+        get_stream_data(stream_clone, string_tx);
+    });
+    while let Ok(message) = string_rx.recv() {
+        let message = match message {
+            Ok(message) => message,
             Err(_) => {
                 let mut players = players.lock().unwrap();
                 for i in 0..players.len() {
@@ -216,9 +207,24 @@ fn handle_connection(
                 tx.send((id, name.clone(), PlayerAction::Exited)).unwrap();
                 break;
             }
+        };
+        if first_time {
+            name = Some(message.clone());
+            let player = Player {
+                id,
+                name: message.clone(),
+                stream: stream.try_clone().unwrap(),
+            };
+            players.lock().unwrap().push(player);
+            first_time = false;
+            tx.send((id, name.clone(), PlayerAction::Joined)).unwrap();
+        } else {
+            tx.send((id, name.clone(), PlayerAction::SentMessage(message)))
+                .unwrap();
         }
     }
 }
+
 fn send_players(stream: &mut TcpStream, players: Arc<Mutex<Vec<Player>>>, id: u32) {
     let mut player_names = String::from("");
     for player in players.lock().unwrap().iter() {
@@ -226,121 +232,140 @@ fn send_players(stream: &mut TcpStream, players: Arc<Mutex<Vec<Player>>>, id: u3
             player_names = format!("{player_names} {}", player.name);
         }
     }
-    player_names = format!("{player_names}\\t");
-    stream.write_all(player_names.as_bytes()).unwrap();
+    send_message(stream, player_names).unwrap();
 }
-fn client(mut stream: TcpStream) {
-    let mut player_names: Option<String> = None;
-    loop {
-        let names = match get_messages_from_stream(&mut stream) {
-            Ok(names) => {
-                if names.len() > 0 {
-                    names[0].clone()
-                } else {
-                    continue;
-                }
-            }
+fn client(stream: TcpStream) {
+    let (tx, rx): (
+        Sender<Result<String, std::io::Error>>,
+        Receiver<Result<String, std::io::Error>>,
+    ) = channel();
+    let stream_clone: TcpStream = stream.try_clone().unwrap();
+    thread::spawn(move || {
+        get_stream_data(stream_clone, tx);
+    });
+    let mut first_message = true;
+    let mut name: Option<String> = None;
+    let stream_clone: TcpStream = stream.try_clone().unwrap();
+    while let Ok(message) = rx.recv() {
+        let message = match message {
+            Ok(str) => str,
             Err(err) => {
-                panic!("{err:#?}");
+                handle_client_errors(err);
+                continue;
             }
         };
-        if names.len() > 0 {
-            player_names = Some(names);
+        if first_message {
+            let player_names = message;
+            first_message = false;
+            name = Some(
+                Input::with_theme(&ColorfulTheme::default())
+                    .with_prompt("Enter name: ")
+                    .validate_with(|x: &String| {
+                        if player_names.contains(x) {
+                            return Err("Name is already taken");
+                        }
+                        if x.contains("#") {
+                            Err("Name cannot contain hashtags")
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .interact()
+                    .unwrap(),
+            );
+            let mut stream_clone1: TcpStream = stream_clone.try_clone().unwrap();
+            let name_clone = name.clone();
+            if let Err(err) = send_message(&mut stream_clone1, name_clone.unwrap()) {
+                handle_client_errors(err);
+            }
+            let stream_clone1: TcpStream = stream_clone.try_clone().unwrap();
+            let name_clone = name.clone();
+            thread::spawn(move || {
+                get_client_input(name_clone.unwrap(), stream_clone1);
+            });
+            continue;
         }
-        break;
-    }
-    let name: String = Input::with_theme(&ColorfulTheme::default())
-        .with_prompt("Enter name: ")
-        .validate_with(|x: &String| {
-            if let Some(player_names) = player_names.clone() {
-                if player_names.contains(x) {
-                    return Err("Name is already taken");
-                }
-            }
-            if x.contains("#") {
-                Err("Name cannot contain hashtags")
-            } else {
-                Ok(())
-            }
-        })
-        .interact()
-        .unwrap();
-    if let Err(err) = stream.write_all(format!("{name}\\t").as_bytes()) {
-        handle_client_errors(err);
-    }
-    let mut stream_copy = stream.try_clone().unwrap();
-    let name_copy = name.clone();
-    thread::spawn(move || loop {
-        match get_messages_from_stream(&mut stream_copy) {
-            Ok(messages) => {
-                for message in messages {
-                    clear_line();
-                    print!("{message}\n{name_copy}: ");
-                    std::io::stdout().flush().unwrap();
-                }
-            }
-            Err(err) => handle_client_errors(err),
+        let name_clone = name.clone();
+        if let Some(name) = name_clone.clone() {
+            clear_line();
+            print!("{message}\n{name}: ");
+            std::io::stdout().flush().unwrap();
         }
-    });
+    }
+}
+fn send_message(stream: &mut TcpStream, message: String) -> Result<(), std::io::Error> {
+    let message_size = message.len() as u32;
+    let message_size_bytes = split_u32_into_u8s(message_size);
+    let mut message_bytes: Vec<u8> = vec![];
+    for byte in message_size_bytes {
+        message_bytes.push(byte);
+    }
+    message_bytes.extend_from_slice(message.as_bytes());
+    stream.write_all(&message_bytes)?;
+    Ok(())
+}
+fn get_client_input(name: String, mut stream: TcpStream) {
     loop {
         let mut str = String::from("");
         print!("{name}: ");
         std::io::stdout().flush().unwrap();
         std::io::stdin().read_line(&mut str).unwrap();
-        if str.contains("\\t") {
-            println!("Cannot send string that contains \\t");
-            continue;
-        }
         str = str.trim().to_string();
-        str = format!("{str}\\t");
-        stream.write_all(str.as_bytes()).unwrap();
+        send_message(&mut stream, str).unwrap();
     }
 }
-fn read_stream(mut stream: &mut TcpStream) -> Result<String, std::io::Error> {
+fn get_stream_data(mut stream: TcpStream, tx: Sender<Result<String, std::io::Error>>) {
     let mut reader = BufReader::new(&mut stream);
-    let mut str = vec![];
-    for _ in 0..512 {
-        str.push(0u8);
-    }
-    match reader.read(&mut str) {
-        Err(err) => {
-            return Err(err);
-        }
-        _ => {}
-    }
-    for i in 0..512 {
-        let i = ((512 - i as i32) - 1).max(0) as usize;
-        if str[i] == 0 {
-            str.pop();
-        } else {
-            break;
-        }
-    }
-    return Ok(String::from_utf8(str.to_vec()).unwrap());
-}
-fn get_messages_from_stream(stream: &mut TcpStream) -> Result<Vec<String>, std::io::Error> {
-    let mut messages = vec![];
-    let mut total_stream = String::new();
-    let str = match read_stream(stream) {
-        Ok(data) => data,
-        Err(err) => return Err(err),
-    };
-    total_stream = format!("{total_stream}{str}");
+    let mut buffer: Vec<u8> = vec![];
+    let mut bytes_left = 0;
+    let mut string_in_progress = false;
     loop {
-        if let None = total_stream.find("\\t") {
-            break;
-        }
-        let new_stream = total_stream.clone();
-        let mut messages_in_stream = new_stream.split("\\t");
-        if messages_in_stream.clone().count() > 1 {
-            messages.push(messages_in_stream.next().unwrap().to_string());
-            total_stream = String::from("");
-            while let Some(new_message) = messages_in_stream.next() {
-                total_stream = format!("{total_stream}{new_message}");
+        let mut chunk = [0u8; CHUNK_SIZE];
+        match reader.read(&mut chunk) {
+            Err(err) => {
+                tx.send(Err(err)).unwrap();
+                return;
+            }
+            Ok(bytes) => {
+                //println!("Got {bytes} bytes!");
+                if string_in_progress {
+                    //println!("Buffer before: {buffer:?}");
+                    buffer.extend_from_slice(&chunk[..bytes]);
+                    //println!("Buffer after: {buffer:?}");
+                    //println!("Bytes left before: {bytes_left}");
+                    bytes_left = (bytes_left - bytes as i32).max(0);
+                    //println!("Bytes left after: {bytes_left}");
+                } else {
+                    //println!("Chunk: {chunk:?}");
+                    let (left, right) = chunk.split_at(4);
+                    //println!("Left: {left:?}");
+                    //println!("Right: {right:?}");
+                    let mut chunk_length_arr = [0u8; 4];
+                    for i in 0..4 {
+                        chunk_length_arr[i] = left[i];
+                    }
+                    let mut chunk = [0u8; CHUNK_SIZE - 4];
+                    for i in 0..CHUNK_SIZE - 4 {
+                        chunk[i] = right[i];
+                    }
+                    bytes_left = combine_u8s_into_u32(chunk_length_arr) as i32;
+                    //println!("Buffer before: {buffer:?}");
+                    buffer.extend_from_slice(&chunk[..(bytes - 4)]);
+                    //println!("Buffer after: {buffer:?}");
+                    //println!("Bytes left before: {bytes_left}");
+                    bytes_left = (bytes_left - (bytes as i32 - 4).max(0)).max(0);
+                    //println!("Bytes left after: {bytes_left}");
+                    string_in_progress = true;
+                }
+                if bytes_left == 0 {
+                    string_in_progress = false;
+                    tx.send(Ok(String::from_utf8(buffer).unwrap())).unwrap();
+                    //println!("Sent string");
+                    buffer = vec![];
+                }
             }
         }
     }
-    Ok(messages)
 }
 fn handle_client_errors(err: std::io::Error) {
     clear_line();
@@ -353,4 +378,19 @@ fn handle_client_errors(err: std::io::Error) {
         }
     }
     std::process::exit(0);
+}
+fn split_u32_into_u8s(input: u32) -> [u8; 4] {
+    let byte1 = (input >> 24) as u8;
+    let byte2 = ((input >> 16) & 0xFF) as u8;
+    let byte3 = ((input >> 8) & 0xFF) as u8;
+    let byte4 = (input & 0xFF) as u8;
+    [byte1, byte2, byte3, byte4]
+}
+
+fn combine_u8s_into_u32(bytes: [u8; 4]) -> u32 {
+    let byte1 = (bytes[0] as u32) << 24;
+    let byte2 = (bytes[1] as u32) << 16;
+    let byte3 = (bytes[2] as u32) << 8;
+    let byte4 = bytes[3] as u32;
+    byte1 | byte2 | byte3 | byte4
 }
