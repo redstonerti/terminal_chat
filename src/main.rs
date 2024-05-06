@@ -1,7 +1,10 @@
 use addr::parse_domain_name;
 use crossterm::{
+    cursor::MoveTo,
+    event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
-    terminal::{Clear, ClearType},
+    terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType},
+    ExecutableCommand,
 };
 use dialoguer::{theme::ColorfulTheme, Input, Select};
 use std::{
@@ -15,7 +18,7 @@ use std::{
 };
 use terminal_chat::ThreadPool;
 const PORT: &str = "10212";
-const DEFAULT_ADDRESS: Option<&str> = Some("127.0.0.1");
+const DEFAULT_ADDRESS: Option<&str> = None;
 const CHUNK_SIZE: usize = 256;
 #[derive(Debug)]
 struct Player {
@@ -196,7 +199,8 @@ fn handle_connection(
     while let Ok(message) = string_rx.recv() {
         let message = match message {
             Ok(message) => message,
-            Err(_) => {
+            Err(err) => {
+                println!("Error: {err:#?}");
                 let mut players = players.lock().unwrap();
                 for i in 0..players.len() {
                     if players[i].id == id {
@@ -246,6 +250,8 @@ fn client(stream: TcpStream) {
     let mut first_message = true;
     let mut name: Option<String> = None;
     let stream_clone: TcpStream = stream.try_clone().unwrap();
+    let current_message = Arc::new(Mutex::new(String::from("")));
+    let current_message_clone1 = Arc::clone(&current_message);
     while let Ok(message) = rx.recv() {
         let message = match message {
             Ok(str) => str,
@@ -280,15 +286,21 @@ fn client(stream: TcpStream) {
             }
             let stream_clone1: TcpStream = stream_clone.try_clone().unwrap();
             let name_clone = name.clone();
+            let current_message_clone2 = Arc::clone(&current_message_clone1);
             thread::spawn(move || {
-                get_client_input(name_clone.unwrap(), stream_clone1);
+                get_client_input(
+                    name_clone.unwrap(),
+                    stream_clone1,
+                    Arc::clone(&current_message_clone2),
+                );
             });
             continue;
         }
         let name_clone = name.clone();
         if let Some(name) = name_clone.clone() {
+            let current_message = current_message.lock().unwrap();
             clear_line();
-            print!("{message}\n{name}: ");
+            print!("{message}\n{name}: {current_message}");
             std::io::stdout().flush().unwrap();
         }
     }
@@ -304,14 +316,85 @@ fn send_message(stream: &mut TcpStream, message: String) -> Result<(), std::io::
     stream.write_all(&message_bytes)?;
     Ok(())
 }
-fn get_client_input(name: String, mut stream: TcpStream) {
+fn get_client_input(name: String, mut stream: TcpStream, current_message: Arc<Mutex<String>>) {
     loop {
-        let mut str = String::from("");
-        print!("{name}: ");
-        std::io::stdout().flush().unwrap();
-        std::io::stdin().read_line(&mut str).unwrap();
-        str = str.trim().to_string();
-        send_message(&mut stream, str).unwrap();
+        enable_raw_mode().unwrap();
+        match crossterm::event::read() {
+            Ok(event) => match event {
+                Event::Key(KeyEvent {
+                    code: KeyCode::Backspace,
+                    kind: KeyEventKind::Press,
+                    ..
+                }) => {
+                    let mut str = current_message.lock().unwrap().clone();
+                    if str.len() == 0 {
+                        continue;
+                    }
+                    let position = crossterm::cursor::position().unwrap();
+                    let terminal_size = get_terminal_size();
+                    let new_position = match position.0 as i32 - 1 {
+                        -1 => (terminal_size.0 as u16, (position.1 as i32 - 1) as u16),
+                        new_x_position => (new_x_position as u16, position.1),
+                    };
+                    stdout()
+                        .execute(MoveTo(new_position.0, new_position.1))
+                        .unwrap();
+                    print!(" ");
+                    stdout()
+                        .execute(MoveTo(new_position.0, new_position.1))
+                        .unwrap();
+                    str.pop().unwrap();
+                    *current_message.lock().unwrap() = str;
+                    std::io::stdout().flush().unwrap();
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    modifiers: KeyModifiers::ALT,
+                    kind: KeyEventKind::Press,
+                    ..
+                }) => {
+                    println!("This should allow you to send multi line messages. WIP for now");
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Char('c'),
+                    modifiers: KeyModifiers::CONTROL,
+                    kind: KeyEventKind::Press,
+                    ..
+                }) => {
+                    disable_raw_mode().unwrap();
+                    std::process::exit(0);
+                }
+                Event::Key(KeyEvent {
+                    code: KeyCode::Enter,
+                    kind: KeyEventKind::Press,
+                    ..
+                }) => {
+                    let str = current_message.lock().unwrap().clone();
+                    if str.len() == 0 {
+                        continue;
+                    }
+                    send_message(&mut stream, str).unwrap();
+                    *current_message.lock().unwrap() = String::from("");
+                    print!("\n{name}: ");
+                    std::io::stdout().flush().unwrap();
+                }
+                Event::Key(KeyEvent {
+                    kind: KeyEventKind::Press,
+                    code: KeyCode::Char(character),
+                    ..
+                }) => {
+                    print!("{character}");
+                    std::io::stdout().flush().unwrap();
+                    let mut str = current_message.lock().unwrap().clone();
+                    str = format!("{str}{character}");
+                    *current_message.lock().unwrap() = str;
+                }
+                _ => {}
+            },
+            Err(err) => {
+                println!("Failed to read input: {err:#?}");
+            }
+        }
     }
 }
 fn get_stream_data(mut stream: TcpStream, tx: Sender<Result<String, std::io::Error>>) {
@@ -327,19 +410,11 @@ fn get_stream_data(mut stream: TcpStream, tx: Sender<Result<String, std::io::Err
                 return;
             }
             Ok(bytes) => {
-                //println!("Got {bytes} bytes!");
                 if string_in_progress {
-                    //println!("Buffer before: {buffer:?}");
                     buffer.extend_from_slice(&chunk[..bytes]);
-                    //println!("Buffer after: {buffer:?}");
-                    //println!("Bytes left before: {bytes_left}");
                     bytes_left = (bytes_left - bytes as i32).max(0);
-                    //println!("Bytes left after: {bytes_left}");
                 } else {
-                    //println!("Chunk: {chunk:?}");
                     let (left, right) = chunk.split_at(4);
-                    //println!("Left: {left:?}");
-                    //println!("Right: {right:?}");
                     let mut chunk_length_arr = [0u8; 4];
                     for i in 0..4 {
                         chunk_length_arr[i] = left[i];
@@ -349,18 +424,21 @@ fn get_stream_data(mut stream: TcpStream, tx: Sender<Result<String, std::io::Err
                         chunk[i] = right[i];
                     }
                     bytes_left = combine_u8s_into_u32(chunk_length_arr) as i32;
-                    //println!("Buffer before: {buffer:?}");
                     buffer.extend_from_slice(&chunk[..(bytes - 4)]);
-                    //println!("Buffer after: {buffer:?}");
-                    //println!("Bytes left before: {bytes_left}");
                     bytes_left = (bytes_left - (bytes as i32 - 4).max(0)).max(0);
-                    //println!("Bytes left after: {bytes_left}");
                     string_in_progress = true;
                 }
                 if bytes_left == 0 {
                     string_in_progress = false;
-                    tx.send(Ok(String::from_utf8(buffer).unwrap())).unwrap();
-                    //println!("Sent string");
+                    let str = String::from_utf8(buffer);
+                    match str {
+                        Ok(string) => {
+                            tx.send(Ok(string)).unwrap();
+                        }
+                        Err(err) => {
+                            println!("Received string with invalid UTF-8: {err:#?}");
+                        }
+                    }
                     buffer = vec![];
                 }
             }
@@ -377,6 +455,7 @@ fn handle_client_errors(err: std::io::Error) {
             println!("Exiting because: {err:?}");
         }
     }
+    disable_raw_mode().unwrap();
     std::process::exit(0);
 }
 fn split_u32_into_u8s(input: u32) -> [u8; 4] {
@@ -393,4 +472,9 @@ fn combine_u8s_into_u32(bytes: [u8; 4]) -> u32 {
     let byte3 = (bytes[2] as u32) << 8;
     let byte4 = bytes[3] as u32;
     byte1 | byte2 | byte3 | byte4
+}
+
+fn get_terminal_size() -> (i32, i32) {
+    let size = terminal_size::terminal_size().unwrap();
+    (size.0 .0 as i32, size.1 .0 as i32)
 }
